@@ -30,18 +30,20 @@ use bevy::{
         globals::{GlobalsBuffer, GlobalsUniform},
         render_asset::RenderAssets,
         render_phase::{
-            AddRenderCommand, DrawFunctions, PhaseItem, PhaseItemExtraIndex, RenderCommand,
-            RenderCommandResult, SetItemPipeline, TrackedRenderPass, ViewSortedRenderPhases,
+            AddRenderCommand, CachedRenderPipelinePhaseItem, DrawFunctions, PhaseItem,
+            PhaseItemExtraIndex, RenderCommand, RenderCommandResult, SetItemPipeline,
+            TrackedRenderPass, ViewSortedRenderPhases,
         },
         render_resource::{
             BindGroup, BindGroupEntries, BindGroupLayoutDescriptor, BindGroupLayoutEntries,
             BlendComponent, BlendFactor, BlendOperation, BlendState, BufferUsages,
-            CachedRenderPipelineId, ColorTargetState, ColorWrites, CompareFunction, DepthBiasState,
-            DepthStencilState, Face, FragmentState, FrontFace, MultisampleState, PipelineCache,
-            PolygonMode, PrimitiveState, PrimitiveTopology, RawBufferVec, RenderPipelineDescriptor,
-            ShaderStages, SpecializedRenderPipeline, SpecializedRenderPipelines, StencilFaceState,
-            StencilState, TextureFormat, VertexAttribute, VertexFormat, VertexState,
-            VertexStepMode, binding_types::uniform_buffer,
+            CachedPipelineState, CachedRenderPipelineId, ColorTargetState, ColorWrites,
+            CompareFunction, DepthBiasState, DepthStencilState, Face, FragmentState, FrontFace,
+            MultisampleState, PipelineCache, PolygonMode, PrimitiveState, PrimitiveTopology,
+            RawBufferVec, RenderPipelineDescriptor, ShaderStages, SpecializedRenderPipeline,
+            SpecializedRenderPipelines, StencilFaceState, StencilState, TextureFormat,
+            VertexAttribute, VertexFormat, VertexState, VertexStepMode,
+            binding_types::uniform_buffer,
         },
         renderer::{RenderDevice, RenderQueue},
         sync_world::{MainEntity, RenderEntity},
@@ -818,9 +820,13 @@ fn queue_shapes(
             };
             let pipeline = pipelines.specialize(&pipeline_cache, &smud_pipeline, specialize_key);
 
-            if pipeline == CachedRenderPipelineId::INVALID {
+            // skip shapes whose pipelines have not been compiled yet
+            if !matches!(
+                pipeline_cache.get_render_pipeline_state(pipeline),
+                CachedPipelineState::Ok(_)
+            ) {
                 debug!("Shape not ready yet, skipping");
-                continue; // skip shapes that are not ready yet
+                continue;
             }
 
             // These items will be sorted by depth with other phase items
@@ -905,9 +911,12 @@ fn prepare_shapes(
     for (retained_view, transparent_phase) in phases.iter_mut() {
         let mut current_batch = None;
         let mut batch_item_index = 0;
-        // let mut batch_image_size = Vec2::ZERO;
-        // let mut batch_image_handle = AssetId::invalid();
-        let mut batch_shader_id = AssetId::invalid();
+        // Batches must never span items with different pipelines: the phase
+        // renderer only draws the leader item of a batch range, so a follower
+        // would otherwise be drawn with the leader's pipeline (for example an
+        // additive shape rendered with alpha blending). The pipeline id covers
+        // the shader, blend mode and all other view-dependent specializations.
+        let mut batch_pipeline = CachedRenderPipelineId::INVALID;
 
         // Iterate through the phase items and detect when successive shapes that can be batched.
         // Spawn an entity with a `ShapeBatch` component for each possible batch.
@@ -922,14 +931,13 @@ fn prepare_shapes(
             else {
                 // If there is a phase item that is not a shape, then we must start a new
                 // batch to draw the other phase item(s) and to respect draw order. This can be
-                // done by invalidating the batch_shader_handle
-                batch_shader_id = AssetId::invalid();
+                // done by invalidating the batch pipeline
+                batch_pipeline = CachedRenderPipelineId::INVALID;
                 continue;
             };
 
-            let shader_id = extracted_shape.shader.id();
-
-            let batch_shader_changed = batch_shader_id != shader_id;
+            let item_pipeline = item.cached_pipeline();
+            let batch_pipeline_changed = batch_pipeline != item_pipeline;
 
             let lrgba: LinearRgba = extracted_shape.color.into();
             let color = lrgba.to_f32_array();
@@ -960,12 +968,12 @@ fn prepare_shapes(
             };
             shape_meta.vertices.push(vertex);
 
-            if batch_shader_changed {
+            if batch_pipeline_changed {
                 batch_item_index = item_index;
 
                 current_batch = Some(batches.entry((*retained_view, item.main_entity())).insert(
                     ShapeBatch {
-                        shader: shader_id,
+                        pipeline: item_pipeline,
                         range: index..index,
                     },
                 ));
@@ -1019,6 +1027,6 @@ struct ShapeBatches(HashMap<(RetainedViewEntity, MainEntity), ShapeBatch>);
 
 #[derive(Component, Eq, PartialEq, Clone)]
 struct ShapeBatch {
-    shader: AssetId<Shader>,
+    pipeline: CachedRenderPipelineId,
     range: Range<u32>,
 }

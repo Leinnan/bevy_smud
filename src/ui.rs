@@ -11,17 +11,18 @@ use bevy::{
         Extract, ExtractSchedule, MainWorld, Render, RenderApp, RenderSystems,
         globals::{GlobalsBuffer, GlobalsUniform},
         render_phase::{
-            AddRenderCommand, DrawFunctions, PhaseItem, PhaseItemExtraIndex, RenderCommand,
-            RenderCommandResult, SetItemPipeline, TrackedRenderPass, ViewSortedRenderPhases,
+            AddRenderCommand, CachedRenderPipelinePhaseItem, DrawFunctions, PhaseItem,
+            PhaseItemExtraIndex, RenderCommand, RenderCommandResult, SetItemPipeline,
+            TrackedRenderPass, ViewSortedRenderPhases,
         },
         render_resource::{
             BindGroup, BindGroupEntries, BindGroupLayoutDescriptor, BindGroupLayoutEntries,
             BlendComponent, BlendFactor, BlendOperation, BlendState, BufferUsages,
-            CachedPipelineState, ColorTargetState, ColorWrites, FragmentState, FrontFace,
-            MultisampleState, PipelineCache, PolygonMode, PrimitiveState, PrimitiveTopology,
-            RawBufferVec, RenderPipelineDescriptor, ShaderStages, SpecializedRenderPipeline,
-            SpecializedRenderPipelines, TextureFormat, VertexAttribute, VertexFormat, VertexState,
-            VertexStepMode, binding_types::uniform_buffer,
+            CachedPipelineState, CachedRenderPipelineId, ColorTargetState, ColorWrites,
+            FragmentState, FrontFace, MultisampleState, PipelineCache, PolygonMode, PrimitiveState,
+            PrimitiveTopology, RawBufferVec, RenderPipelineDescriptor, ShaderStages,
+            SpecializedRenderPipeline, SpecializedRenderPipelines, TextureFormat, VertexAttribute,
+            VertexFormat, VertexState, VertexStepMode, binding_types::uniform_buffer,
         },
         renderer::{RenderDevice, RenderQueue},
         sync_world::{MainEntity, TemporaryRenderEntity},
@@ -351,12 +352,19 @@ impl SpecializedRenderPipeline for UiShapePipeline {
     }
 }
 
-/// Prepare vertex buffers - generates vertices for each extracted node
+/// Prepares the vertex buffers for UI shapes and batches them.
+///
+/// Iterates each view's sorted `TransparentUi` phase, writes one instance per
+/// item in draw order, and merges consecutive items that share a pipeline into
+/// a single batch (and thereby a single draw call), like bevy_ui's
+/// `prepare_uinodes` does for its own nodes.
+#[allow(clippy::type_complexity)]
 fn prepare_ui_shapes(
     mut ui_shape_meta: ResMut<UiShapeMeta>,
     render_device: Res<RenderDevice>,
     render_queue: Res<RenderQueue>,
     extracted_nodes: Res<ExtractedUiShapes>,
+    mut transparent_render_phases: ResMut<ViewSortedRenderPhases<TransparentUi>>,
     view_uniforms: Res<ViewUniforms>,
     globals_buffer: Res<GlobalsBuffer>,
     pipeline: Res<UiShapePipeline>,
@@ -377,38 +385,77 @@ fn prepare_ui_shapes(
 
     ui_shape_meta.vertices.clear();
 
-    // Generate one instance per node - vertex shader will use vertex_index to determine corners
-    for node in &extracted_nodes.nodes {
-        // Extract transform components from Affine2
-        let position = node.transform.translation;
+    let mut instance_index: u32 = 0;
 
-        // Extract rotation and scale from the matrix
-        let x_axis = node.transform.matrix2.x_axis;
-        let y_axis = node.transform.matrix2.y_axis;
+    for (_, transparent_phase) in transparent_render_phases.iter_mut() {
+        // Batches must never span items with different pipelines, since the
+        // phase renderer only draws the leader item of a batch range
+        let mut batch_pipeline = CachedRenderPipelineId::INVALID;
+        let mut batch_item_index = 0;
+        let mut batch_first_instance = 0;
 
-        // Scale is the length of the axis vectors
-        let scale_x = x_axis.length();
-        let scale_y = y_axis.length();
-        let scale = (scale_x + scale_y) / 2.0; // Average scale (assuming uniform)
+        for item_index in 0..transparent_phase.items.len() {
+            let item = &transparent_phase.items[item_index];
+            let item_pipeline = item.cached_pipeline();
+            let item_entity = item.entity();
 
-        // Rotation is the direction of the x-axis (normalized)
-        let rotation = if scale_x > 0.0 {
-            let normalized = x_axis / scale_x;
-            [normalized.x, normalized.y] // [cos, sin]
-        } else {
-            [1.0, 0.0] // No rotation
-        };
+            let Some(node) = extracted_nodes
+                .nodes
+                .get(item.index)
+                .filter(|node| node.render_entity == item_entity)
+            else {
+                // Not one of our shape items: start a new batch to respect draw order
+                batch_pipeline = CachedRenderPipelineId::INVALID;
+                continue;
+            };
 
-        let bounds = node.rect.size() / 2.0;
+            // Extract transform components from Affine2
+            let position = node.transform.translation;
 
-        ui_shape_meta.vertices.push(UiShapeVertex {
-            position: [position.x, position.y, 0.0],
-            color: node.color.to_linear().to_f32_array(),
-            params: node.params.to_array(),
-            rotation,
-            scale,
-            bounds: [bounds.x, bounds.y, node.extra_bounds, node.extra_bounds],
-        });
+            // Extract rotation and scale from the matrix
+            let x_axis = node.transform.matrix2.x_axis;
+            let y_axis = node.transform.matrix2.y_axis;
+
+            // Scale is the length of the axis vectors
+            let scale_x = x_axis.length();
+            let scale_y = y_axis.length();
+            let scale = (scale_x + scale_y) / 2.0; // Average scale (assuming uniform)
+
+            // Rotation is the direction of the x-axis (normalized)
+            let rotation = if scale_x > 0.0 {
+                let normalized = x_axis / scale_x;
+                [normalized.x, normalized.y] // [cos, sin]
+            } else {
+                [1.0, 0.0] // No rotation
+            };
+
+            let bounds = node.rect.size() / 2.0;
+
+            ui_shape_meta.vertices.push(UiShapeVertex {
+                position: [position.x, position.y, 0.0],
+                color: node.color.to_linear().to_f32_array(),
+                params: node.params.to_array(),
+                rotation,
+                scale,
+                bounds: [bounds.x, bounds.y, node.extra_bounds, node.extra_bounds],
+            });
+
+            if item_pipeline != batch_pipeline {
+                batch_pipeline = item_pipeline;
+                batch_item_index = item_index;
+                batch_first_instance = instance_index;
+            }
+
+            // The leader item draws every instance in the batch range, while
+            // the follower items are skipped by the phase renderer. The range
+            // is stored in instance coordinates: since every item corresponds
+            // to exactly one instance, its length also matches the number of
+            // items the phase renderer has to skip.
+            *transparent_phase.items[batch_item_index].batch_range_mut() =
+                batch_first_instance..(instance_index + 1);
+
+            instance_index += 1;
+        }
     }
 
     ui_shape_meta
@@ -428,21 +475,30 @@ fn queue_ui_shapes(
 ) {
     let draw_function = draw_functions.read().id::<DrawUiShapes>();
 
+    // The camera -> (view, phase) resolution is cached across consecutive
+    // nodes, since all shapes usually target the same camera
+    // (like bevy_ui's `queue_uinodes`).
+    let mut current_camera_entity = Entity::PLACEHOLDER;
+    let mut current_view: Option<&ExtractedView> = None;
+    let mut current_phase = None;
+
     // Each node goes into the UI phase of its own target camera
     // (bevy_ui's `queue_uinodes` does the same). The pipeline is specialized
     // on that view's target format: an HDR camera renders UI to
     // `Rgba16Float`, and a pipeline built for `Rgba8UnormSrgb` fails
     // validation there.
     for (index, node) in extracted_nodes.nodes.iter().enumerate() {
-        let Some(view) = render_views
-            .get(node.extracted_camera_entity)
-            .ok()
-            .and_then(|ui_view| camera_views.get(ui_view.0).ok())
-        else {
-            continue;
-        };
-        let target_format = view.target_format;
-        let Some(transparent_phase) = transparent_render_phases.get_mut(&view.retained_view_entity)
+        if node.extracted_camera_entity != current_camera_entity {
+            current_camera_entity = node.extracted_camera_entity;
+            current_view = render_views
+                .get(node.extracted_camera_entity)
+                .ok()
+                .and_then(|ui_view| camera_views.get(ui_view.0).ok());
+            current_phase = current_view
+                .and_then(|view| transparent_render_phases.get_mut(&view.retained_view_entity));
+        }
+
+        let (Some(view), Some(transparent_phase)) = (current_view, current_phase.as_deref_mut())
         else {
             continue;
         };
@@ -451,7 +507,7 @@ fn queue_ui_shapes(
         let key = UiShapePipelineKey {
             shader: node.shader.clone(),
             blend_mode: node.blend_mode,
-            target_format,
+            target_format: view.target_format,
         };
 
         // Specialize the pipeline for this shader combination
@@ -466,15 +522,19 @@ fn queue_ui_shapes(
         }
 
         // Use stack_index with an offset to control z-ordering
-        // We use a value slightly after MATERIAL (0.05) so UiShapes render in proper layer order
-        let sort_key = FloatOrd(node.stack_index as f32 + stack_z_offsets::MATERIAL + 0.01);
+        // We use a value slightly after MATERIAL (0.05) so UiShapes render in
+        // proper layer order. The offset must be unique per node type to avoid
+        // z-fighting with bevy_ui's own stack offsets (TEXT_SELECTION is 0.055,
+        // TEXT is 0.06), so we use 0.0025 (0.0525 in total).
+        let sort_key = FloatOrd(node.stack_index as f32 + stack_z_offsets::MATERIAL + 0.0025);
 
+        // batch_range is calculated in prepare_ui_shapes
         transparent_phase.add_transient(TransparentUi {
             entity: (node.render_entity, node.main_entity),
             draw_function,
             pipeline: pipeline_id,
             sort_key,
-            batch_range: 0..1,
+            batch_range: 0..0,
             extra_index: PhaseItemExtraIndex::None,
             index,
             indexed: false,
@@ -529,13 +589,11 @@ impl RenderCommand<TransparentUi> for DrawUiShapeBatch {
             return RenderCommandResult::Failure("no vertex buffer");
         };
 
-        // Get the index of this specific UI node from the phase item
-        let node_index = item.index as u32;
-
         pass.set_vertex_buffer(0, vertices.slice(..));
-        // Draw 4 vertices for THIS specific instance only
-        // Each instance uses 4 vertices in a triangle strip
-        pass.draw(0..4, node_index..(node_index + 1));
+        // Draw every shape in this batch with a single call. The batch range
+        // holds a range of instances in the shared vertex buffer (see
+        // `prepare_ui_shapes`).
+        pass.draw(0..4, item.batch_range.clone());
         RenderCommandResult::Success
     }
 }
@@ -564,7 +622,8 @@ impl Plugin for UiShapePlugin {
                     Render,
                     (
                         queue_ui_shapes.in_set(RenderSystems::Queue),
-                        prepare_ui_shapes.in_set(RenderSystems::PrepareResources),
+                        // batching needs the phases to be sorted first
+                        prepare_ui_shapes.in_set(RenderSystems::PrepareBindGroups),
                     ),
                 );
         }
