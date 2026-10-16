@@ -16,6 +16,11 @@ struct Vertex {
     @location(4) scale: f32,
     // z and w contain extra padding
     @location(5) bounds: vec4<f32>,
+#ifdef UI_CLIP
+    @location(6) clip: vec4<f32>,
+    @location(7) aux: vec4<f32>,
+    @location(8) aux_color: vec4<f32>,
+#endif
 };
 
 struct VertexOutput {
@@ -24,6 +29,11 @@ struct VertexOutput {
     @location(1) pos: vec2<f32>,
     @location(2) params: vec4<f32>,
     @location(3) bounds: vec2<f32>,
+#ifdef UI_CLIP
+    @location(4) clip: vec4<f32>,
+    @location(5) aux: vec4<f32>,
+    @location(6) aux_color: vec4<f32>,
+#endif
 };
 
 @vertex
@@ -54,5 +64,10 @@ fn vertex(
     out.pos = corner;
 #endif
     out.bounds = vertex.bounds.xy;
+#ifdef UI_CLIP
+    out.clip = vertex.clip;
+    out.aux = vertex.aux;
+    out.aux_color = vertex.aux_color;
+#endif
     return out;
 }

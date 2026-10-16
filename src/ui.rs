@@ -8,7 +8,7 @@ use bevy::{
     math::{Affine2, Rect},
     prelude::*,
     render::{
-        Extract, ExtractSchedule, MainWorld, Render, RenderApp, RenderSystems,
+        Extract, ExtractSchedule, GpuResourceAppExt, MainWorld, Render, RenderApp, RenderSystems,
         globals::{GlobalsBuffer, GlobalsUniform},
         render_phase::{
             AddRenderCommand, CachedRenderPipelinePhaseItem, DrawFunctions, PhaseItem,
@@ -28,13 +28,16 @@ use bevy::{
         sync_world::{MainEntity, TemporaryRenderEntity},
         view::{ExtractedView, ViewUniform, ViewUniformOffset, ViewUniforms},
     },
-    ui::{ComputedNode, ComputedStackIndex, ComputedUiTargetCamera, Node, UiGlobalTransform},
+    ui::{
+        CalculatedClip, ComputedNode, ComputedStackIndex, ComputedUiTargetCamera, Node,
+        UiGlobalTransform,
+    },
     ui_render::{TransparentUi, UiCameraMap, UiCameraView, stack_z_offsets},
 };
 use bytemuck::{Pod, Zeroable};
 
 use crate::{
-    BlendMode, FloatOrd, GeneratedShaders, SIMPLE_FILL_HANDLE, VertexBufferLayout,
+    BlendMode, FloatOrd, GeneratedShaders, PendingShaders, SIMPLE_FILL_HANDLE, VertexBufferLayout,
     shader_loading::VERTEX_SHADER_HANDLE,
 };
 
@@ -66,6 +69,14 @@ pub struct UiShape {
 
     /// Extra padding to add to the bounds when rendering the shape
     pub extra_bounds: f32,
+
+    /// Second parameter vector for fills (`FillInput.aux`); zero for the
+    /// world-space `SmudShape` path
+    pub aux: Vec4,
+
+    /// Second colour for fills (`FillInput.aux_color`, linear); zero for the
+    /// world-space `SmudShape` path
+    pub aux_color: Color,
 }
 
 impl Default for UiShape {
@@ -77,6 +88,8 @@ impl Default for UiShape {
             params: Vec4::ZERO,
             blend_mode: BlendMode::default(),
             extra_bounds: 0.0,
+            aux: Vec4::ZERO,
+            aux_color: Color::NONE,
         }
     }
 }
@@ -98,6 +111,12 @@ struct UiShapeVertex {
     rotation: [f32; 2],
     scale: f32,
     bounds: [f32; 4],
+    /// Clip rect in target pixels (`min.xy`, `max.xy`)
+    clip: [f32; 4],
+    /// Second fill parameters (`FillInput.aux`)
+    aux: [f32; 4],
+    /// Second fill colour (`FillInput.aux_color`)
+    aux_color: [f32; 4],
 }
 
 #[derive(Resource)]
@@ -125,8 +144,12 @@ struct ExtractedUiShape {
     extra_bounds: f32,
     color: Color,
     params: Vec4,
+    aux: Vec4,
+    aux_color: Color,
     shader: Handle<Shader>,
     blend_mode: BlendMode,
+    /// `CalculatedClip` of the node (none = unclipped)
+    clip: Option<Rect>,
     /// Render entity of the node's target camera.
     extracted_camera_entity: Entity,
 }
@@ -136,15 +159,35 @@ struct ExtractedUiShapes {
     nodes: Vec<ExtractedUiShape>,
 }
 
-// TODO: do some of this work in the main world instead, so we don't need to take a mutable
-// reference to MainWorld.
+// Generates the combined sdf+fill shaders for added and modified UI shapes.
+// Shapes whose shader assets have not loaded yet are remembered in
+// `PendingShaders` (shared with the world-space path) and retried until their
+// assets become available.
 fn generate_shaders(
     mut main_world: ResMut<MainWorld>,
     mut generated_shaders: ResMut<GeneratedShaders>,
+    mut pending_shaders: ResMut<PendingShaders>,
 ) {
     main_world.resource_scope(|world, mut shaders: Mut<Assets<Shader>>| {
-        for node in world.query::<&UiShape>().iter(world) {
-            generated_shaders.try_generate(&node.sdf, &node.fill, &mut shaders);
+        // Retry pairs that were waiting for their shader assets to load
+        pending_shaders.0.retain(|(sdf, fill)| {
+            generated_shaders
+                .try_generate(sdf, fill, &mut shaders)
+                .is_none()
+        });
+
+        // Only scan shapes that were added or modified since the last frame
+        let mut ui_shapes = world.query_filtered::<&UiShape, Changed<UiShape>>();
+        for ui_shape in ui_shapes.iter(world) {
+            if generated_shaders
+                .try_generate(&ui_shape.sdf, &ui_shape.fill, &mut shaders)
+                .is_none()
+            {
+                let pair = (ui_shape.sdf.clone(), ui_shape.fill.clone());
+                if !pending_shaders.0.contains(&pair) {
+                    pending_shaders.0.push(pair);
+                }
+            }
         }
     });
 }
@@ -163,6 +206,7 @@ fn extract_ui_shapes(
             &ComputedStackIndex,
             &UiGlobalTransform,
             &InheritedVisibility,
+            Option<&CalculatedClip>,
             &ComputedUiTargetCamera,
         )>,
     >,
@@ -171,7 +215,7 @@ fn extract_ui_shapes(
     extracted_nodes.nodes.clear();
     let mut camera_mapper = camera_map.get_mapper();
 
-    for (entity, ui_shape, computed_node, stack_index, transform, visibility, target) in
+    for (entity, ui_shape, computed_node, stack_index, transform, visibility, clip, target) in
         ui_shapes.iter()
     {
         // hidden nodes (and zero-sized ones) are not drawn,
@@ -209,8 +253,11 @@ fn extract_ui_shapes(
             extra_bounds: ui_shape.extra_bounds,
             color: ui_shape.color,
             params: ui_shape.params,
+            aux: ui_shape.aux,
+            aux_color: ui_shape.aux_color,
             shader,
             blend_mode: ui_shape.blend_mode,
+            clip: clip.map(|clip| clip.clip),
             extracted_camera_entity,
         });
     }
@@ -263,7 +310,7 @@ impl SpecializedRenderPipeline for UiShapePipeline {
             immediate_size: 0,
             vertex: VertexState {
                 shader: VERTEX_SHADER_HANDLE,
-                shader_defs: vec!["Y_DOWN".into()],
+                shader_defs: vec!["Y_DOWN".into(), "UI_CLIP".into()],
                 entry_point: Some("vertex".into()),
                 buffers: vec![VertexBufferLayout {
                     array_stride: std::mem::size_of::<UiShapeVertex>() as u64,
@@ -305,12 +352,30 @@ impl SpecializedRenderPipeline for UiShapePipeline {
                             offset: 56,
                             shader_location: 5,
                         },
+                        // clip rect
+                        VertexAttribute {
+                            format: VertexFormat::Float32x4,
+                            offset: 72,
+                            shader_location: 6,
+                        },
+                        // aux
+                        VertexAttribute {
+                            format: VertexFormat::Float32x4,
+                            offset: 88,
+                            shader_location: 7,
+                        },
+                        // aux_color
+                        VertexAttribute {
+                            format: VertexFormat::Float32x4,
+                            offset: 104,
+                            shader_location: 8,
+                        },
                     ],
                 }],
             },
             fragment: Some(FragmentState {
                 shader,
-                shader_defs: vec![],
+                shader_defs: vec!["UI_CLIP".into()],
                 entry_point: Some("fragment".into()),
                 targets: vec![Some(ColorTargetState {
                     format: key.target_format,
@@ -438,6 +503,11 @@ fn prepare_ui_shapes(
                 rotation,
                 scale,
                 bounds: [bounds.x, bounds.y, node.extra_bounds, node.extra_bounds],
+                clip: node.clip.map_or([-1.0e9, -1.0e9, 1.0e9, 1.0e9], |clip| {
+                    [clip.min.x, clip.min.y, clip.max.x, clip.max.y]
+                }),
+                aux: node.aux.to_array(),
+                aux_color: node.aux_color.to_linear().to_f32_array(),
             });
 
             if item_pipeline != batch_pipeline {
@@ -610,10 +680,10 @@ impl Plugin for UiShapePlugin {
         if let Some(render_app) = app.get_sub_app_mut(RenderApp) {
             render_app
                 .add_render_command::<TransparentUi, DrawUiShapes>()
-                .init_resource::<UiShapeMeta>()
+                .init_gpu_resource::<UiShapeMeta>()
                 .init_resource::<UiShapePipeline>()
+                .init_gpu_resource::<SpecializedRenderPipelines<UiShapePipeline>>()
                 .init_resource::<ExtractedUiShapes>()
-                .init_resource::<SpecializedRenderPipelines<UiShapePipeline>>()
                 .add_systems(
                     ExtractSchedule,
                     (generate_shaders, extract_ui_shapes.after(generate_shaders)),

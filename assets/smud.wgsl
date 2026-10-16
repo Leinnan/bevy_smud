@@ -16,6 +16,9 @@ struct FillInput {
     params: vec4<f32>,   // User-defined parameters for fill
     distance: f32,
     color: vec4<f32>,
+    bounds: vec2<f32>,    // Half-extents (width/2, height/2) of the node bounds
+    aux: vec4<f32>,       // Second user-defined parameter vector (UI only; zero in the world-space path)
+    aux_color: vec4<f32>, // Second colour, linear (UI only; zero in the world-space path)
 }
 
 fn sd_circle(p: vec2<f32>, r: f32) -> f32 {

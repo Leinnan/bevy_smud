@@ -58,6 +58,7 @@ fn fill(input: smud::FillInput) -> vec4<f32> {{
     let p = input.pos;
     let params = input.params;
     let d = input.distance;
+    let color = input.color;
     {body}
 }}
 "#

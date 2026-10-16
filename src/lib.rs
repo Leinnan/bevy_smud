@@ -25,7 +25,7 @@ use bevy::{
     platform::collections::HashMap,
     prelude::*,
     render::{
-        Extract, MainWorld, Render, RenderApp, RenderSystems,
+        Extract, GpuResourceAppExt, MainWorld, Render, RenderApp, RenderSystems,
         camera::ExtractedCamera,
         globals::{GlobalsBuffer, GlobalsUniform},
         render_asset::RenderAssets,
@@ -134,9 +134,10 @@ impl Plugin for SmudPlugin {
         // TODO: picking
         if let Some(render_app) = app.get_sub_app_mut(RenderApp) {
             render_app
-                .init_resource::<SpecializedRenderPipelines<SmudPipeline>>()
-                .init_resource::<ShapeMeta>()
+                .init_gpu_resource::<SpecializedRenderPipelines<SmudPipeline>>()
+                .init_gpu_resource::<ShapeMeta>()
                 .init_resource::<ExtractedShapes>()
+                .init_resource::<PendingShaders>()
                 .add_render_command::<Transparent2d, DrawSmudShape>()
                 .add_systems(
                     ExtractSchedule,
@@ -514,19 +515,41 @@ struct FragmentInput {{
     @location(1) pos: vec2<f32>,
     @location(2) params: vec4<f32>,
     @location(3) bounds: vec2<f32>,
+#ifdef UI_CLIP
+    @location(4) clip: vec4<f32>,
+    @location(5) aux: vec4<f32>,
+    @location(6) aux_color: vec4<f32>,
+    @builtin(position) frag_coord: vec4<f32>,
+#endif
 }};
 
 @fragment
 fn fragment(in: FragmentInput) -> @location(0) vec4<f32> {{
     let sdf_input = smud::SdfInput(in.pos, in.params, in.bounds);
     let d = sdf::sdf(sdf_input);
+    var aux = vec4<f32>(0.0);
+    var aux_color = vec4<f32>(0.0);
+#ifdef UI_CLIP
+    aux = in.aux;
+    aux_color = in.aux_color;
+#endif
     let fill_input = smud::FillInput(
         in.pos,
         in.params,
         d,
         in.color,
+        in.bounds,
+        aux,
+        aux_color,
     );
     var color = fill::fill(fill_input);
+
+#ifdef UI_CLIP
+    // Overflow clipping. Applied as an alpha mask rather than an early
+    // `discard`, so fills can keep using derivatives in uniform control flow.
+    let inside_clip = step(in.clip.xy, in.frag_coord.xy) * step(in.frag_coord.xy, in.clip.zw);
+    color.a = color.a * inside_clip.x * inside_clip.y;
+#endif
 
 #ifdef TONEMAP_IN_SHADER
     color = tonemapping::tone_mapping(color, view.color_grading);
@@ -555,15 +578,39 @@ fn fragment(in: FragmentInput) -> @location(0) vec4<f32> {{
     }
 }
 
-// TODO: do some of this work in the main world instead, so we don't need to take a mutable
-// reference to MainWorld.
+/// Sdf/fill handle pairs whose shader assets have not finished loading yet.
+/// These are retried every frame until their shader assets become available.
+#[derive(Resource, Default)]
+pub(crate) struct PendingShaders(Vec<(Handle<Shader>, Handle<Shader>)>);
+
+/// Generates the combined sdf+fill shaders for added and modified shapes.
+/// Shapes whose shader assets have not loaded yet are remembered in
+/// [`PendingShaders`] and retried until their assets become available.
 fn generate_shaders(
     mut main_world: ResMut<MainWorld>,
     mut generated_shaders: ResMut<GeneratedShaders>,
+    mut pending_shaders: ResMut<PendingShaders>,
 ) {
     main_world.resource_scope(|world, mut shaders: Mut<Assets<Shader>>| {
-        for shape in world.query::<&SmudShape>().iter(world) {
-            generated_shaders.try_generate(&shape.sdf, &shape.fill, &mut shaders);
+        // Retry pairs that were waiting for their shader assets to load
+        pending_shaders.0.retain(|(sdf, fill)| {
+            generated_shaders
+                .try_generate(sdf, fill, &mut shaders)
+                .is_none()
+        });
+
+        // Only scan shapes that were added or modified since the last frame
+        let mut shapes = world.query_filtered::<&SmudShape, Changed<SmudShape>>();
+        for shape in shapes.iter(world) {
+            if generated_shaders
+                .try_generate(&shape.sdf, &shape.fill, &mut shaders)
+                .is_none()
+            {
+                let pair = (shape.sdf.clone(), shape.fill.clone());
+                if !pending_shaders.0.contains(&pair) {
+                    pending_shaders.0.push(pair);
+                }
+            }
         }
     });
 }
@@ -736,9 +783,9 @@ fn queue_shapes(
     draw_functions: Res<DrawFunctions<Transparent2d>>,
     smud_pipeline: Res<SmudPipeline>,
     mut pipelines: ResMut<SpecializedRenderPipelines<SmudPipeline>>,
-    pipeline_cache: ResMut<PipelineCache>,
-    extracted_shapes: ResMut<ExtractedShapes>,
+    extracted_shapes: Res<ExtractedShapes>,
     mut transparent_render_phases: ResMut<ViewSortedRenderPhases<Transparent2d>>,
+    pipeline_cache: Res<PipelineCache>,
     mut views: Query<(
         &RenderVisibleEntities,
         &ExtractedCamera,
