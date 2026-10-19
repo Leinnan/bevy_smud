@@ -16,15 +16,15 @@ fn main() {
 }
 
 fn setup(mut commands: Commands, asset_server: Res<AssetServer>) {
-    // bevy_on_fire.wgsl uses functions from bevy.wgsl, so we need to make sure bevy.wgsl is loaded
-    commands.insert_resource(Shaders(vec![asset_server.load("bevy.wgsl")]));
+    // bevy_on_fire.wesl uses functions from bevy.wesl, so we need to make sure bevy.wesl is loaded
+    commands.insert_resource(Shaders(vec![asset_server.load("bevy.wesl")]));
 
     commands.spawn((
         SmudShape {
             color: Color::srgb(0.36, 0.41, 0.45),
-            sdf: asset_server.load("bevy_on_fire.wgsl"),
+            sdf: asset_server.load("bevy_on_fire.wesl"),
             bounds: Rectangle::from_length(800.),
-            fill: asset_server.load("fills/fire.wgsl"),
+            fill: asset_server.load("fills/fire.wesl"),
             ..default()
         },
         BevyShape,

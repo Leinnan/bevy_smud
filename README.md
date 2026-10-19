@@ -61,9 +61,18 @@ fn setup(
 
 Make sure you reuse the shaders, i.e. don't call `add_sdf_expr` every frame.
 
-You can also define shapes in .wgsl files. Note that in order to use the built-in shapes, you have to import [`smud`](https://github.com/johanhelsing/bevy_smud/blob/main/assets/smud.wgsl), and you must create a function named `sdf` that takes a `smud::SdfInput` and returns `f32`.
+You can also define shapes in [WESL](https://wesl-lang.dev) (`.wesl`) files. Plain `.wgsl` files can't import other shaders, so they won't work. The built-in shapes are available as [`smud::…`](https://github.com/johanhelsing/bevy_smud/blob/main/assets/smud.wesl) (e.g. `smud::sd_circle`) without an import, and you must create a function named `sdf` that takes a `smud::SdfInput` and returns `f32`. Other shader files in your assets folder can be imported relative to the assets root, e.g. `import package::bevy::sd_bevy;` for `assets/bevy.wesl`.
 
-Other than that, make sure you understand how to combine shapes, use symmetries and change domains. For instance, the [bevy](https://github.com/johanhelsing/bevy_smud/blob/main/assets/bevy.wgsl) in the screenshot above is built up of several circles, ellipses, and a vesica for the beak.
+### Migrating shaders from bevy_smud 0.14 (Bevy 0.19)
+
+Bevy 0.20 replaced naga_oil with WESL, so `.wgsl` shape and fill files need porting:
+
+- rename them to `.wesl` and update the paths you load them from
+- remove `#define_import_path …` and `#import smud`; `smud::…` paths keep working
+- `#import a::b` becomes `import a::b;`, and imports from other asset files use `import package::path::to::file::item;`
+- `#ifdef X … #endif` becomes `@if(X) …`
+
+Other than that, make sure you understand how to combine shapes, use symmetries and change domains. For instance, the [bevy](https://github.com/johanhelsing/bevy_smud/blob/main/assets/bevy.wesl) in the screenshot above is built up of several circles, ellipses, and a vesica for the beak.
 
 Also, check out the [examples](https://github.com/johanhelsing/bevy_smud/blob/main/examples). In particular, the [basic](https://github.com/johanhelsing/bevy_smud/blob/main/examples/basic.rs) example should be a good place to start.
 
@@ -117,7 +126,8 @@ The `main` branch targets the latest bevy release.
 
 |bevy|bevy_smud|
 |----|---------|
-|0.19|0.14, main|
+|0.20|main     |
+|0.19|0.14     |
 |0.18|0.13     |
 |0.17|0.12     |
 |0.16|0.11     |

@@ -1,16 +1,16 @@
 use bevy::prelude::*;
 
-use crate::util::generate_shader_id;
+use crate::{shader_loading::wesl_module, util::generate_shader_id};
 
 /// Extension trait for Assets<Shader> for conveniently creating new shaders from code
 pub trait SdfAssets {
-    /// Create a sdf shader from the given wgsl body
+    /// Create a sdf shader from the given wesl body
     fn add_sdf_body<T: Into<String>>(&mut self, sdf: T) -> Handle<Shader>;
-    /// Create a sdf shader from the given wgsl expression
+    /// Create a sdf shader from the given wesl expression
     fn add_sdf_expr<T: Into<String>>(&mut self, sdf: T) -> Handle<Shader>;
-    /// Create a fill shader from the given wgsl body
+    /// Create a fill shader from the given wesl body
     fn add_fill_body<T: Into<String>>(&mut self, fill: T) -> Handle<Shader>;
-    /// Create a fill shader from the given wgsl expression
+    /// Create a fill shader from the given wesl expression
     fn add_fill_expr<T: Into<String>>(&mut self, fill: T) -> Handle<Shader>;
 }
 
@@ -18,13 +18,9 @@ impl SdfAssets for Assets<Shader> {
     fn add_sdf_body<T: Into<String>>(&mut self, sdf: T) -> Handle<Shader> {
         let body = sdf.into();
         let id = generate_shader_id();
-        let shader = Shader::from_wgsl(
+        let shader = wesl_module(
             format!(
                 r#"
-#define_import_path smud::sdf{id}
-
-#import smud
-
 fn sdf(input: smud::SdfInput) -> f32 {{
     // Backward compatibility aliases for the old API
     let p = input.pos;
@@ -35,7 +31,7 @@ fn sdf(input: smud::SdfInput) -> f32 {{
 }}
 "#
             ),
-            file!(),
+            &format!("smud::sdf{id}"),
         );
         self.add(shader)
     }
@@ -43,13 +39,10 @@ fn sdf(input: smud::SdfInput) -> f32 {{
     fn add_fill_body<T: Into<String>>(&mut self, fill: T) -> Handle<Shader> {
         let body = fill.into();
         let id = generate_shader_id();
-        let shader = Shader::from_wgsl(
+        let shader = wesl_module(
             format!(
                 r#"
-#define_import_path smud::fill{id}
-
-#import smud
-#import bevy_render::globals::Globals
+import bevy_render::globals::Globals;
 
 @group(0) @binding(1) var<uniform> globals: Globals;
 
@@ -63,7 +56,7 @@ fn fill(input: smud::FillInput) -> vec4<f32> {{
 }}
 "#
             ),
-            file!(),
+            &format!("smud::fill{id}"),
         );
         self.add(shader)
     }

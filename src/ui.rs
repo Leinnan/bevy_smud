@@ -1,6 +1,7 @@
 //! Provides `UiShape` component for rendering SDF shapes in Bevy's UI
 
 use bevy::{
+    ecs::entity::EntityHashMap,
     ecs::system::{
         SystemParamItem,
         lifetimeless::{Read, SRes},
@@ -230,6 +231,11 @@ fn extract_ui_shapes(
             continue;
         };
 
+        let Some(clip) = clip.map_or(Some(None), clip_to_rect) else {
+            // Fully clipped by an ancestor
+            continue;
+        };
+
         let Some(shader) = generated_shaders
             .0
             .get(&(ui_shape.sdf.id(), ui_shape.fill.id()))
@@ -239,7 +245,7 @@ fn extract_ui_shapes(
             continue;
         };
 
-        let render_entity = commands.spawn(TemporaryRenderEntity).id();
+        let render_entity = commands.spawn(TemporaryRenderEntity::default()).id();
 
         extracted_nodes.nodes.push(ExtractedUiShape {
             main_entity: entity.into(),
@@ -257,10 +263,43 @@ fn extract_ui_shapes(
             aux_color: ui_shape.aux_color,
             shader,
             blend_mode: ui_shape.blend_mode,
-            clip: clip.map(|clip| clip.clip),
+            clip,
             extracted_camera_entity,
         });
     }
+}
+
+/// Clip rect extent used for unclipped edges
+const UNCLIPPED: f32 = 1.0e9;
+
+/// Reduces a node's `CalculatedClip` to the single axis-aligned rect (in
+/// target pixels) the shader clips against.
+///
+/// Returns `None` if the node is fully clipped, `Some(None)` if it is not
+/// clipped at all. Exact for axis-aligned clip ancestors; for rotated ones the
+/// clip region is approximated by its bounding box.
+fn clip_to_rect(clip: &CalculatedClip) -> Option<Option<Rect>> {
+    let rects = clip.rects()?;
+    let mut result: Option<Rect> = None;
+    for clip_rect in rects {
+        let clip_local_to_world = clip_rect.world_to_clip_local.inverse();
+        // Clipping along a single axis leaves the other edges infinite, which
+        // would turn into NaN when transformed
+        let min = clip_rect.rect.min.max(Vec2::splat(-UNCLIPPED));
+        let max = clip_rect.rect.max.min(Vec2::splat(UNCLIPPED));
+        let corners = [min, Vec2::new(max.x, min.y), max, Vec2::new(min.x, max.y)]
+            .map(|corner| clip_local_to_world.transform_point2(corner));
+        let world_rect = corners.iter().fold(
+            Rect::from_corners(corners[0], corners[0]),
+            |rect, &corner| rect.union_point(corner),
+        );
+        let intersection = result.map_or(world_rect, |result| result.intersect(world_rect));
+        if intersection.is_empty() {
+            return None;
+        }
+        result = Some(intersection);
+    }
+    Some(result)
 }
 
 /// Pipeline key for specializing UI rendering based on shaders
@@ -311,6 +350,7 @@ impl SpecializedRenderPipeline for UiShapePipeline {
             vertex: VertexState {
                 shader: VERTEX_SHADER_HANDLE,
                 shader_defs: vec!["Y_DOWN".into(), "UI_CLIP".into()],
+                constants: Vec::new(),
                 entry_point: Some("vertex".into()),
                 buffers: vec![VertexBufferLayout {
                     array_stride: std::mem::size_of::<UiShapeVertex>() as u64,
@@ -376,6 +416,7 @@ impl SpecializedRenderPipeline for UiShapePipeline {
             fragment: Some(FragmentState {
                 shader,
                 shader_defs: vec!["UI_CLIP".into()],
+                constants: Vec::new(),
                 entry_point: Some("fragment".into()),
                 targets: vec![Some(ColorTargetState {
                     format: key.target_format,
@@ -452,6 +493,15 @@ fn prepare_ui_shapes(
 
     let mut instance_index: u32 = 0;
 
+    // Phase items no longer carry an index into the extracted nodes, so look
+    // nodes up by their render entity instead
+    let node_indices: EntityHashMap<usize> = extracted_nodes
+        .nodes
+        .iter()
+        .enumerate()
+        .map(|(index, node)| (node.render_entity, index))
+        .collect();
+
     for (_, transparent_phase) in transparent_render_phases.iter_mut() {
         // Batches must never span items with different pipelines, since the
         // phase renderer only draws the leader item of a batch range
@@ -464,10 +514,9 @@ fn prepare_ui_shapes(
             let item_pipeline = item.cached_pipeline();
             let item_entity = item.entity();
 
-            let Some(node) = extracted_nodes
-                .nodes
-                .get(item.index)
-                .filter(|node| node.render_entity == item_entity)
+            let Some(node) = node_indices
+                .get(&item_entity)
+                .map(|&index| &extracted_nodes.nodes[index])
             else {
                 // Not one of our shape items: start a new batch to respect draw order
                 batch_pipeline = CachedRenderPipelineId::INVALID;
@@ -503,9 +552,11 @@ fn prepare_ui_shapes(
                 rotation,
                 scale,
                 bounds: [bounds.x, bounds.y, node.extra_bounds, node.extra_bounds],
-                clip: node.clip.map_or([-1.0e9, -1.0e9, 1.0e9, 1.0e9], |clip| {
-                    [clip.min.x, clip.min.y, clip.max.x, clip.max.y]
-                }),
+                clip: node
+                    .clip
+                    .map_or([-UNCLIPPED, -UNCLIPPED, UNCLIPPED, UNCLIPPED], |clip| {
+                        [clip.min.x, clip.min.y, clip.max.x, clip.max.y]
+                    }),
                 aux: node.aux.to_array(),
                 aux_color: node.aux_color.to_linear().to_f32_array(),
             });
@@ -557,7 +608,7 @@ fn queue_ui_shapes(
     // on that view's target format: an HDR camera renders UI to
     // `Rgba16Float`, and a pipeline built for `Rgba8UnormSrgb` fails
     // validation there.
-    for (index, node) in extracted_nodes.nodes.iter().enumerate() {
+    for node in &extracted_nodes.nodes {
         if node.extracted_camera_entity != current_camera_entity {
             current_camera_entity = node.extracted_camera_entity;
             current_view = render_views
@@ -606,7 +657,6 @@ fn queue_ui_shapes(
             sort_key,
             batch_range: 0..0,
             extra_index: PhaseItemExtraIndex::None,
-            index,
             indexed: false,
         });
     }

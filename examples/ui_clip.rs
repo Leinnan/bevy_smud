@@ -25,7 +25,7 @@ fn setup(
 ) {
     commands.spawn(Camera2d);
 
-    let circle_sdf = asset_server.load("shapes/circle.wgsl");
+    let circle_sdf = asset_server.load("shapes/circle.wesl");
 
     // A fill that blends from `color` to `aux_color` based on `aux.x`, using
     // the extra fill inputs
@@ -109,7 +109,7 @@ fn setup(
         },
         UiShape {
             color: css::YELLOW.into(),
-            sdf: asset_server.load("shapes/rectangle.wgsl"),
+            sdf: asset_server.load("shapes/rectangle.wesl"),
             params: Vec4::new(75., 75., 0., 0.),
             ..default()
         },

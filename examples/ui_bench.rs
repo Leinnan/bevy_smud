@@ -39,11 +39,11 @@ enum GameState {
 
 #[derive(Resource, AssetCollection)]
 struct AssetHandles {
-    #[asset(path = "shapes/circle.wgsl")]
+    #[asset(path = "shapes/circle.wesl")]
     circle: Handle<Shader>,
-    #[asset(path = "shapes/rectangle.wgsl")]
+    #[asset(path = "shapes/rectangle.wesl")]
     rectangle: Handle<Shader>,
-    #[asset(path = "fills/simple.wgsl")]
+    #[asset(path = "fills/simple.wesl")]
     simple_fill: Handle<Shader>,
 }
 

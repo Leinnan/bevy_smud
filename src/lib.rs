@@ -50,11 +50,11 @@ use bevy::{
         texture::{FallbackImage, GpuImage},
         view::{
             COLOR_TARGET_FORMAT_MASK_BITS, ExtractedView, RenderVisibleEntities,
-            RetainedViewEntity, ViewUniform, ViewUniformOffset, ViewUniforms,
-            texture_format_from_code, texture_format_to_code,
+            ResolvedCompositingSpace, RetainedViewEntity, ViewUniform, ViewUniformOffset,
+            ViewUniforms, texture_format_from_code, texture_format_to_code,
         },
     },
-    shader::{ShaderDefVal, ShaderImport},
+    shader::{ShaderDefVal, ShaderImport, Source},
 };
 use bytemuck::{Pod, Zeroable};
 use fixedbitset::FixedBitSet;
@@ -93,7 +93,7 @@ pub mod prelude {
     };
 
     #[cfg(feature = "bevy_primitives")]
-    pub use bevy::math::primitives::{Annulus, Circle, Ellipse, Rectangle};
+    pub use bevy::shape::{Annulus, Circle, Ellipse, Rectangle};
 
     #[cfg(feature = "bevy_picking")]
     pub use crate::picking_backend::{
@@ -273,8 +273,8 @@ impl SpecializedRenderPipeline for SmudPipeline {
                 .intersection(PipelineKey::TONEMAP_METHOD_RESERVED_BITS);
 
             match method {
-                PipelineKey::TONEMAP_METHOD_NONE => {
-                    shader_defs.push("TONEMAP_METHOD_NONE".into());
+                PipelineKey::TONEMAP_METHOD_LINEAR => {
+                    shader_defs.push("TONEMAP_METHOD_LINEAR".into());
                 }
                 PipelineKey::TONEMAP_METHOD_REINHARD => {
                     shader_defs.push("TONEMAP_METHOD_REINHARD".into());
@@ -367,6 +367,7 @@ impl SpecializedRenderPipeline for SmudPipeline {
                 shader: VERTEX_SHADER_HANDLE,
                 entry_point: Some("vertex".into()),
                 shader_defs: Vec::new(),
+                constants: Vec::new(),
                 buffers: vec![VertexBufferLayout {
                     array_stride: vertex_array_stride,
                     step_mode: VertexStepMode::Instance,
@@ -377,6 +378,7 @@ impl SpecializedRenderPipeline for SmudPipeline {
                 shader: key.shader.clone(),
                 entry_point: Some("fragment".into()),
                 shader_defs,
+                constants: Vec::new(),
                 targets: vec![Some(ColorTargetState {
                     format: key.mesh.target_format(),
                     blend: Some(if key.mesh.contains(PipelineKey::BLEND_ADDITIVE) {
@@ -458,81 +460,50 @@ impl GeneratedShaders {
             return Some(handle.clone());
         }
 
-        let sdf_import_path = match shaders.get_mut(sdf) {
-            Some(mut shader) => match &shader.import_path {
-                ShaderImport::Custom(p) => p.to_owned(),
-                _ => {
-                    let id = generate_shader_id();
-                    let path = format!("smud::generated::{id}");
-                    shader.import_path = ShaderImport::Custom(path.clone());
-                    path
-                }
-            },
-            None => {
-                debug!("Waiting for sdf to load");
-                return None;
-            }
+        let Some(sdf_import_path) = shaders.get(sdf).and_then(wesl_import_path) else {
+            debug!("Waiting for sdf to load");
+            return None;
         };
-
-        let fill_import_path = match shaders.get_mut(fill) {
-            Some(mut shader) => match &shader.import_path {
-                ShaderImport::Custom(p) => p.to_owned(),
-                _ => {
-                    let id = generate_shader_id();
-                    let path = format!("smud::generated::{id}");
-                    shader.import_path = ShaderImport::Custom(path.clone());
-                    path
-                }
-            },
-            None => {
-                debug!("Waiting for fill to load");
-                return None;
-            }
+        let Some(fill_import_path) = shaders.get(fill).and_then(wesl_import_path) else {
+            debug!("Waiting for fill to load");
+            return None;
         };
 
         debug!("Generating shader");
-        let generated_shader = Shader::from_wgsl(
+        let id = generate_shader_id();
+        let generated_shader = Shader::from_wesl(
             format!(
                 r#"
-#ifdef TONEMAP_IN_SHADER
-#import bevy_core_pipeline::tonemapping
-#endif
-#ifdef SRGB_OUTPUT
-#import bevy_render::color_operations::linear_to_srgb
-#endif
-#ifdef OKLAB_OUTPUT
-#import bevy_render::color_operations::linear_rgb_to_oklab
-#endif
+@if(TONEMAP_IN_SHADER)
+import bevy_core_pipeline::tonemapping;
+@if(SRGB_OUTPUT)
+import bevy_render::color_operations::linear_to_srgb;
+@if(OKLAB_OUTPUT)
+import bevy_render::color_operations::linear_rgb_to_oklab;
 
-#import bevy_smud::view_bindings::view
-#import smud
-
-#import {sdf_import_path} as sdf
-#import {fill_import_path} as fill
+import bevy_smud::view_bindings::view;
 
 struct FragmentInput {{
     @location(0) color: vec4<f32>,
     @location(1) pos: vec2<f32>,
     @location(2) params: vec4<f32>,
     @location(3) bounds: vec2<f32>,
-#ifdef UI_CLIP
-    @location(4) clip: vec4<f32>,
-    @location(5) aux: vec4<f32>,
-    @location(6) aux_color: vec4<f32>,
-    @builtin(position) frag_coord: vec4<f32>,
-#endif
+    @if(UI_CLIP) @location(4) clip: vec4<f32>,
+    @if(UI_CLIP) @location(5) aux: vec4<f32>,
+    @if(UI_CLIP) @location(6) aux_color: vec4<f32>,
+    @if(UI_CLIP) @builtin(position) frag_coord: vec4<f32>,
 }};
 
 @fragment
 fn fragment(in: FragmentInput) -> @location(0) vec4<f32> {{
     let sdf_input = smud::SdfInput(in.pos, in.params, in.bounds);
-    let d = sdf::sdf(sdf_input);
+    let d = {sdf_import_path}::sdf(sdf_input);
     var aux = vec4<f32>(0.0);
     var aux_color = vec4<f32>(0.0);
-#ifdef UI_CLIP
-    aux = in.aux;
-    aux_color = in.aux_color;
-#endif
+    @if(UI_CLIP) {{
+        aux = in.aux;
+        aux_color = in.aux_color;
+    }}
     let fill_input = smud::FillInput(
         in.pos,
         in.params,
@@ -542,32 +513,31 @@ fn fragment(in: FragmentInput) -> @location(0) vec4<f32> {{
         aux,
         aux_color,
     );
-    var color = fill::fill(fill_input);
+    var color = {fill_import_path}::fill(fill_input);
 
-#ifdef UI_CLIP
     // Overflow clipping. Applied as an alpha mask rather than an early
     // `discard`, so fills can keep using derivatives in uniform control flow.
-    let inside_clip = step(in.clip.xy, in.frag_coord.xy) * step(in.frag_coord.xy, in.clip.zw);
-    color.a = color.a * inside_clip.x * inside_clip.y;
-#endif
+    @if(UI_CLIP) {{
+        let inside_clip = step(in.clip.xy, in.frag_coord.xy) * step(in.frag_coord.xy, in.clip.zw);
+        color.a = color.a * inside_clip.x * inside_clip.y;
+    }}
 
-#ifdef TONEMAP_IN_SHADER
+    @if(TONEMAP_IN_SHADER)
     color = tonemapping::tone_mapping(color, view.color_grading);
-#endif
 
-#ifdef SRGB_OUTPUT
+    @if(SRGB_OUTPUT)
     color = vec4(linear_to_srgb(color.rgb), color.a);
-#endif
 
-#ifdef OKLAB_OUTPUT
+    @if(OKLAB_OUTPUT)
     color = vec4(linear_rgb_to_oklab(color.rgb), color.a);
-#endif
 
     return color;
 }}
 "#
             ),
-            format!("smud::generated::{shader_key:?}"),
+            // a plain (non-embedded) path makes this a module of the asset
+            // package, so `package::` resolves shapes loaded from asset files
+            format!("smud_generated/shader{id}.wesl"),
         );
 
         let generated_shader_handle = shaders.add(generated_shader);
@@ -576,6 +546,25 @@ fn fragment(in: FragmentInput) -> @location(0) vec4<f32> {{
 
         Some(generated_shader_handle)
     }
+}
+
+/// The WESL module path under which a sdf or fill shader can be imported.
+///
+/// Returns `None` (after logging an error) for shaders that are not WESL, as
+/// those can't be imported.
+fn wesl_import_path(shader: &Shader) -> Option<String> {
+    if !matches!(shader.source, Source::Wesl(_)) {
+        error_once!(
+            "bevy_smud shapes and fills must be WESL shaders, but `{}` is not (rename .wgsl files to .wesl)",
+            shader.path
+        );
+        return None;
+    }
+    Some(match &shader.import_path {
+        ShaderImport::Custom(path) => path.clone(),
+        // shaders loaded from asset files are modules of the asset package
+        ShaderImport::AssetPath(path) => format!("package{}", path.replace('/', "::")),
+    })
 }
 
 /// Sdf/fill handle pairs whose shader assets have not finished loading yet.
@@ -698,7 +687,7 @@ bitflags::bitflags! {
         const MSAA_RESERVED_BITS                = Self::MSAA_MASK_BITS << Self::MSAA_SHIFT_BITS;
         const PRIMITIVE_TOPOLOGY_RESERVED_BITS  = Self::PRIMITIVE_TOPOLOGY_MASK_BITS << Self::PRIMITIVE_TOPOLOGY_SHIFT_BITS;
         const TONEMAP_METHOD_RESERVED_BITS      = Self::TONEMAP_METHOD_MASK_BITS << Self::TONEMAP_METHOD_SHIFT_BITS;
-        const TONEMAP_METHOD_NONE               = 0 << Self::TONEMAP_METHOD_SHIFT_BITS;
+        const TONEMAP_METHOD_LINEAR               = 0 << Self::TONEMAP_METHOD_SHIFT_BITS;
         const TONEMAP_METHOD_REINHARD           = 1 << Self::TONEMAP_METHOD_SHIFT_BITS;
         const TONEMAP_METHOD_REINHARD_LUMINANCE = 2 << Self::TONEMAP_METHOD_SHIFT_BITS;
         const TONEMAP_METHOD_ACES_FITTED        = 3 << Self::TONEMAP_METHOD_SHIFT_BITS;
@@ -793,13 +782,15 @@ fn queue_shapes(
         &Msaa,
         Option<&Tonemapping>,
         Option<&DebandDither>,
+        Option<&ResolvedCompositingSpace>,
     )>,
     // ?
 ) {
     let draw_smud_shape_function = draw_functions.read().get_id::<DrawSmudShape>().unwrap();
 
     // Iterate over each view (a camera is a view)
-    for (visible_entities, camera, view, msaa, tonemapping, dither) in &mut views {
+    for (visible_entities, camera, view, msaa, tonemapping, dither, compositing_space) in &mut views
+    {
         let Some(transparent_phase) = transparent_render_phases.get_mut(&view.retained_view_entity)
         else {
             continue;
@@ -810,10 +801,11 @@ fn queue_shapes(
 
         let mut view_key = PipelineKey::from_target_format(view.target_format) | mesh_key;
 
-        if camera.compositing_space == Some(CompositingSpace::Srgb) {
+        let compositing_space = ResolvedCompositingSpace::space(compositing_space);
+        if compositing_space == Some(CompositingSpace::Srgb) {
             view_key |= PipelineKey::SRGB_COMPOSITING;
         }
-        if camera.compositing_space == Some(CompositingSpace::Oklab) {
+        if compositing_space == Some(CompositingSpace::Oklab) {
             view_key |= PipelineKey::OKLAB_COMPOSITING;
         }
 
@@ -821,7 +813,7 @@ fn queue_shapes(
             if let Some(tonemapping) = tonemapping {
                 view_key |= PipelineKey::TONEMAP_IN_SHADER;
                 view_key |= match tonemapping {
-                    Tonemapping::None => PipelineKey::TONEMAP_METHOD_NONE,
+                    Tonemapping::None | Tonemapping::Linear => PipelineKey::TONEMAP_METHOD_LINEAR,
                     Tonemapping::Reinhard => PipelineKey::TONEMAP_METHOD_REINHARD,
                     Tonemapping::ReinhardLuminance => {
                         PipelineKey::TONEMAP_METHOD_REINHARD_LUMINANCE
